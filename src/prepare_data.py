@@ -3,8 +3,9 @@
 Pasos:
   1. Descarga el subconjunto en español de HEAD-QA v2.
   2. Quita las preguntas con imagen y las anuladas (ra = 0).
-  3. Divide por años: test = 2021-2022, dev = 2013-2020.
-  4. Quita del test las preguntas casi idénticas a alguna de dev
+  3. Se queda solo con los exámenes de CATEGORIES (FIR y BIR).
+  4. Divide por años: test = 2021-2022, dev = 2013-2020.
+  5. Quita del test las preguntas casi idénticas a alguna de dev
      (similitud TF-IDF >= SIM_THRESHOLD) y las guarda aparte, salvo los
      falsos positivos revisados a mano (NOT_DUPLICATES).
 
@@ -23,6 +24,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 TEST_YEARS = [2021, 2022]
+CATEGORIES = ["pharmacology", "biology"]  # FIR y BIR
 SIM_THRESHOLD = 0.9  # a partir de aquí se consideran preguntas "gemelas"
 
 # Falsos positivos revisados a mano: superan el umbral pero son preguntas distintas
@@ -79,6 +81,9 @@ def main():
     # Quitar preguntas con imagen y anuladas (ra = 0)
     limpio = df[(~df["tiene_imagen"]) & (df["ra"] > 0)].drop(columns=["tiene_imagen"])
 
+    # Quedarse solo con los exámenes elegidos
+    limpio = limpio[limpio["category"].isin(CATEGORIES)]
+
     # División por años
     test = limpio[limpio["year"].isin(TEST_YEARS)]
     dev = limpio[~limpio["year"].isin(TEST_YEARS)]
@@ -90,7 +95,7 @@ def main():
     save(test, "test.jsonl")
     save(duplicados, "test_duplicados.jsonl")
 
-    print(f"Total: {len(df)} | Limpio: {len(limpio)} | Dev: {len(dev)} | Test: {len(test)}")
+    print(f"Total: {len(df)} | Limpio ({', '.join(CATEGORIES)}): {len(limpio)} | Dev: {len(dev)} | Test: {len(test)}")
     print(f"Quitadas del test por tener gemela en dev (sim >= {SIM_THRESHOLD}): {len(duplicados)}")
     print(f"Guardado en {DATA_DIR}")
 
