@@ -1,3 +1,7 @@
 datasets>=3.0
 pandas
 scikit-learn
+scipy
+requests
+beautifulsoup4
+pypdf
