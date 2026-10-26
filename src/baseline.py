@@ -44,7 +44,9 @@ def load_model(model_id):
         quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
         model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=quant, device_map="auto")
     else:
+        print("AVISO: no hay GPU, el modelo se carga en CPU (solo sirve para pruebas con modelos pequeños)")
         model = AutoModelForCausalLM.from_pretrained(model_id)
+    print(f"Modelo cargado en: {model.device}")
     model.eval()
     return tokenizer, model
 
