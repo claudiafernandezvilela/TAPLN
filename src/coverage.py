@@ -1,7 +1,15 @@
 """Mide cuánto cubren los corpus de data/corpus/ las preguntas de HEAD-QA (FIR y BIR).
 
-Para cada corpus por separado y para todos juntos ("TODAS") indexa los pasajes con
-BM25 (léxico, sin GPU) y calcula:
+Para cada corpus por separado y para todos juntos ("TODAS") recupera pasajes con
+uno de estos buscadores y calcula las métricas de abajo:
+  bm25     léxico (palabras en común), rápido y sin dependencias extra
+  dense    semántico: embeddings de un modelo multilingüe de sentence-transformers
+           (por defecto intfloat/multilingual-e5-small). La primera vez calcula los
+           embeddings de cada corpus y los guarda en data/corpus/cache/embeddings/.
+  hybrid   fusión de bm25 y dense con Reciprocal Rank Fusion (RRF): cada pasaje
+           suma 1 / (60 + posición) en cada uno de los dos rankings.
+
+Métricas:
   correcta_en_contexto      la respuesta correcta aparece en los k pasajes
                             recuperados con la pregunta
   distractores_en_contexto  fracción de opciones incorrectas que aparecen
@@ -14,10 +22,16 @@ Uso:
   python src/coverage.py                                  # todos los corpus, sobre test
   python src/coverage.py --corpus libretexts cima
   python src/coverage.py --split dev --k 10
+  python src/coverage.py --corpus libretexts --retriever dense
+  python src/coverage.py --split dev --retriever hybrid
+  python src/coverage.py --retriever dense --modelo intfloat/multilingual-e5-base
 
 Entrada:  data/<split>.jsonl y data/corpus/<corpus>.jsonl  ({id, source, title, text})
-Salida:   outputs/cobertura/cobertura_<split>_<corpus>.csv          (por pregunta)
-          outputs/cobertura/cobertura_<split>_<corpus>_resumen.csv  (medias por examen)
+Salida:   outputs/corpus/cobertura_<split>[_<retriever>-<modelo>]_<corpus>.csv          (por pregunta)
+          outputs/corpus/cobertura_<split>[_<retriever>-<modelo>]_<corpus>_resumen.csv  (medias)
+
+Ojo: aunque se use "dense" o "hybrid", correcta_en_contexto sigue comprobando la
+respuesta por palabras dentro de los pasajes recuperados, así que es una cota baja.
 """
 import argparse
 import json
@@ -32,7 +46,9 @@ from sklearn.feature_extraction.text import CountVectorizer
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 CORPUS_DIR = DATA_DIR / "corpus"
-OUT_DIR = ROOT / "outputs" / "cobertura"
+OUT_DIR = ROOT / "outputs" / "corpus"
+EMB_DIR = CORPUS_DIR / "cache" / "embeddings"
+MODELO_DENSO = "intfloat/multilingual-e5-small"
 
 METRICAS = ["correcta_en_contexto", "distractores_en_contexto", "solo_correcta", "ir_acierto", "azar"]
 
@@ -89,6 +105,67 @@ class BM25:
             yield i, (q[i:i + lote] @ self.w).toarray()
 
 
+class Denso:
+    """Búsqueda semántica: similitud coseno entre embeddings de consulta y pasajes."""
+
+    def __init__(self, modelo, nombres, corpus):
+        from sentence_transformers import SentenceTransformer
+
+        self.modelo = SentenceTransformer(modelo)
+        # Los modelos E5 esperan estos prefijos en las consultas y en los pasajes
+        self.e5 = "e5" in modelo.lower()
+        self.emb = np.vstack([self.embeddings_corpus(modelo, n, corpus[n]) for n in nombres])
+
+    def codificar(self, textos, prefijo, progreso=False):
+        if self.e5:
+            textos = [prefijo + t for t in textos]
+        return self.modelo.encode(textos, batch_size=64, normalize_embeddings=True,
+                                  convert_to_numpy=True, show_progress_bar=progreso).astype(np.float32)
+
+    def embeddings_corpus(self, modelo, nombre, docs):
+        """Embeddings de un corpus, guardados en disco para no recalcularlos."""
+        ruta = EMB_DIR / f"{modelo.replace('/', '__')}__{nombre}.npy"
+        if ruta.exists():
+            emb = np.load(ruta)
+            if len(emb) == len(docs):
+                return emb
+            print(f"  (el corpus {nombre} ha cambiado: se recalculan sus embeddings)")
+        print(f"  Calculando embeddings de {nombre} ({len(docs)} pasajes); solo la primera vez...")
+        emb = self.codificar([f"{d['title']}. {d['text']}" for d in docs], "passage: ", progreso=True)
+        EMB_DIR.mkdir(parents=True, exist_ok=True)
+        np.save(ruta, emb)
+        return emb
+
+    def puntuar(self, consultas, lote=128):
+        """Mismo formato que BM25.puntuar: (índice de la primera consulta, puntuaciones)."""
+        q = self.codificar(consultas, "query: ")
+        for i in range(0, len(q), lote):
+            yield i, q[i:i + lote] @ self.emb.T
+
+
+class Hibrido:
+    """Reciprocal Rank Fusion de BM25 y Denso: cada pasaje suma 1 / (c + posición) en
+    cada ranking. Solo se fusionan los `candidatos` primeros de cada buscador (con
+    puntuación > 0); el resto de pasajes queda con 0."""
+
+    def __init__(self, buscadores, c=60, candidatos=100):
+        self.buscadores, self.c, self.candidatos = buscadores, c, candidatos
+
+    def puntuar(self, consultas, lote=128):
+        """Mismo formato que BM25.puntuar, con la puntuación RRF en lugar de la original."""
+        for partes in zip(*(b.puntuar(consultas, lote) for b in self.buscadores)):
+            ini = partes[0][0]
+            fusion = np.zeros_like(partes[0][1], dtype=np.float32)
+            filas = np.arange(len(fusion))[:, None]
+            for _, sc in partes:
+                m = min(self.candidatos, sc.shape[1])
+                top = np.argpartition(-sc, m - 1, axis=1)[:, :m]
+                top = np.take_along_axis(top, np.argsort(-np.take_along_axis(sc, top, axis=1), axis=1), axis=1)
+                rrf = 1 / (self.c + np.arange(1, m + 1, dtype=np.float32))
+                fusion[filas, top] += np.where(np.take_along_axis(sc, top, axis=1) > 0, rrf, 0)
+            yield ini, fusion
+
+
 def presente(opcion_tokens, contexto_tokens, umbral=0.8):
     """La opción 'aparece' si al menos el 80% de sus términos están en el contexto."""
     if not opcion_tokens:
@@ -96,9 +173,7 @@ def presente(opcion_tokens, contexto_tokens, umbral=0.8):
     return sum(t in contexto_tokens for t in opcion_tokens) / len(opcion_tokens) >= umbral
 
 
-def evaluar(nombre, docs, preguntas, k):
-    print(f"  Indexando {nombre} ({len(docs)} pasajes)...")
-    bm25 = BM25([f"{d['title']} {d['text']}" for d in docs])
+def evaluar(nombre, docs, buscador, preguntas, k):
     tokens_doc = {}
 
     def toks(i):
@@ -108,7 +183,7 @@ def evaluar(nombre, docs, preguntas, k):
 
     filas = []
     # 1) Recuperación con la pregunta: ¿están la correcta / los distractores en el top-k?
-    for ini, sc in bm25.puntuar([q["qtext"] for q in preguntas]):
+    for ini, sc in buscador.puntuar([q["qtext"] for q in preguntas]):
         for j, fila in enumerate(sc):
             q = preguntas[ini + j]
             top = np.argpartition(-fila, k)[:k] if len(fila) > k else np.arange(len(fila))
@@ -131,7 +206,7 @@ def evaluar(nombre, docs, preguntas, k):
             consultas.append(f"{q['qtext']} {a['atext']}")
             quien.append((iq, a["aid"]))
     mejor = {}
-    for ini, sc in bm25.puntuar(consultas):
+    for ini, sc in buscador.puntuar(consultas):
         for j, m in enumerate(sc.max(axis=1)):
             iq, aid = quien[ini + j]
             if iq not in mejor or m > mejor[iq][0]:
@@ -152,25 +227,43 @@ def resumir(df, orden):
     return resumen.reindex(orden)
 
 
-def cobertura(nombres, split, k):
+def crear_buscador(retriever, modelo, nombre, nombres, corpus):
+    """Buscador para un corpus ("TODAS" junta los de todos los corpus)."""
+    docs = [d for n in nombres for d in corpus[n]]
+    if retriever == "bm25":
+        print(f"  Indexando {nombre} con BM25 ({len(docs)} pasajes)...")
+        return docs, BM25([f"{d['title']} {d['text']}" for d in docs])
+    print(f"  Preparando {nombre} con {modelo} ({len(docs)} pasajes)...")
+    denso = Denso(modelo, nombres, corpus)
+    if retriever == "dense":
+        return docs, denso
+    print(f"  Indexando {nombre} con BM25 para la fusión RRF...")
+    return docs, Hibrido([BM25([f"{d['title']} {d['text']}" for d in docs]), denso])
+
+
+def cobertura(nombres, split, k, retriever, modelo):
     preguntas = leer_jsonl(DATA_DIR / f"{split}.jsonl")
     corpus = {n: leer_jsonl(CORPUS_DIR / f"{n}.jsonl") for n in nombres}
-    if len(corpus) > 1:
-        corpus["TODAS"] = [d for ds in corpus.values() for d in ds]
+    grupos = {n: [n] for n in nombres}
+    if len(nombres) > 1:
+        grupos["TODAS"] = list(nombres)
 
     filas = []
-    for nombre, docs in corpus.items():
-        filas += evaluar(nombre, docs, preguntas, k)
+    for nombre, miembros in grupos.items():
+        docs, buscador = crear_buscador(retriever, modelo, nombre, miembros, corpus)
+        filas += evaluar(nombre, docs, buscador, preguntas, k)
     df = pd.DataFrame(filas)
-    resumen = resumir(df, list(corpus))
+    resumen = resumir(df, list(grupos))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    base = OUT_DIR / f"cobertura_{split}_{'+'.join(nombres)}"
+    etiqueta = "" if retriever == "bm25" else f"_{retriever}-{modelo.split('/')[-1]}"
+    base = OUT_DIR / f"cobertura_{split}{etiqueta}_{'+'.join(nombres)}"
     df.to_csv(f"{base}.csv", index=False)
     resumen.to_csv(f"{base}_resumen.csv")
 
     pd.set_option("display.width", 200)
-    print(f"\nCobertura sobre {split} ({len(preguntas)} preguntas, top-{k} pasajes):\n")
+    buscador = {"bm25": "BM25", "dense": modelo, "hybrid": f"BM25 + {modelo} (RRF)"}[retriever]
+    print(f"\nCobertura sobre {split} ({len(preguntas)} preguntas, top-{k} pasajes, {buscador}):\n")
     for m in METRICAS[:-1]:
         print(f"{m}:")
         print(resumen[m].to_string(), "\n")
@@ -185,10 +278,13 @@ def main():
                    help="corpus de data/corpus/ a evaluar (por defecto, todos)")
     p.add_argument("--split", choices=["dev", "test"], default="test")
     p.add_argument("--k", type=int, default=5, help="pasajes recuperados por pregunta")
+    p.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default="bm25")
+    p.add_argument("--modelo", default=MODELO_DENSO,
+                   help="modelo de sentence-transformers para --retriever dense o hybrid")
     args = p.parse_args()
     if not args.corpus:
         p.error(f"no hay corpus en {CORPUS_DIR.relative_to(ROOT)}; ejecuta antes src/build_corpus.py")
-    cobertura(args.corpus, args.split, args.k)
+    cobertura(args.corpus, args.split, args.k, args.retriever, args.modelo)
 
 
 if __name__ == "__main__":
