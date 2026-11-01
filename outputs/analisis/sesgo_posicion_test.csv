@@ -1,0 +1,5 @@
+modelo,opcion,elegida,correcta,acierto_si_es_correcta
+Qwen2.5-7B-Instruct,1,190,206,0.6504854368932039
+Qwen2.5-7B-Instruct,2,247,235,0.7106382978723405
+Qwen2.5-7B-Instruct,3,215,203,0.7241379310344828
+Qwen2.5-7B-Instruct,4,165,173,0.630057803468208
