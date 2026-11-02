@@ -1,0 +1,9 @@
+modelo,opcion,elegida,correcta,acierto_si_es_correcta
+Qwen2.5-7B-Instruct+rag-hybrid-cima+libretexts+sefh-k5,1,187,206,0.6747572815533981
+Qwen2.5-7B-Instruct+rag-hybrid-cima+libretexts+sefh-k5,2,238,235,0.723404255319149
+Qwen2.5-7B-Instruct+rag-hybrid-cima+libretexts+sefh-k5,3,219,203,0.7487684729064039
+Qwen2.5-7B-Instruct+rag-hybrid-cima+libretexts+sefh-k5,4,173,173,0.653179190751445
+Qwen2.5-7B-Instruct,1,190,206,0.6504854368932039
+Qwen2.5-7B-Instruct,2,247,235,0.7106382978723405
+Qwen2.5-7B-Instruct,3,215,203,0.7241379310344828
+Qwen2.5-7B-Instruct,4,165,173,0.630057803468208
