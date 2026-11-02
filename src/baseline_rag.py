@@ -57,6 +57,38 @@ def build_rag_prompt(row, chunks) -> str:
         f"{contexto}\n\n{build_prompt(row)}"
     )
 
+def recuperar_por_opcion(buscador, df, cupo):
+    """Para cada pregunta, `cupo` chunks por opción buscando con pregunta + opción.
+    Devuelve, por pregunta, una lista de pares (aid, [índices de chunks])."""
+    consultas, quien = [], []
+    for iq, (_, row) in enumerate(df.iterrows()):
+        for a in row["answers"]:
+            consultas.append(f"{row['qtext']} {a['atext']}")
+            quien.append((iq, a["aid"]))
+    # Se piden algunos de más para poder saltar los chunks que ya trajo otra opción
+    tops = recuperar(buscador, consultas, cupo + 5)
+
+    grupos = [[] for _ in range(len(df))]
+    usados = [set() for _ in range(len(df))]
+    for (iq, aid), top in zip(quien, tops):
+        elegidos = [i for i in top if i not in usados[iq]][:cupo]
+        usados[iq].update(elegidos)
+        grupos[iq].append((aid, elegidos))
+    return grupos
+
+
+def build_rag_prompt_opciones(row, grupos, docs) -> str:
+    """El prompt de baseline.py con los chunks agrupados según la opción que los trajo."""
+    bloques = []
+    for aid, idx in grupos:
+        pasajes = "\n\n".join(f"{docs[i]['title']}\n{docs[i]['text']}" for i in idx)
+        bloques.append(f"Sobre la opción {aid}:\n{pasajes}")
+    contexto = "\n\n".join(bloques)
+    return (
+        "Contexto (fragmentos recuperados de libros y fichas técnicas para comprobar cada "
+        "opción; puede que no todos sean útiles):\n\n"
+        f"{contexto}\n\n{build_prompt(row)}"
+    )
 
 @torch.no_grad()
 def predict(prompt, n_opciones, tokenizer, model, option_ids):
@@ -108,6 +140,9 @@ def main():
     parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default="hybrid")
     parser.add_argument("--modelo-denso", default=MODELO_DENSO, help="embeddings para dense o hybrid")
     parser.add_argument("--k", type=int, default=5, help="chunks de contexto por pregunta")
+    parser.add_argument("--consulta", choices=["pregunta", "opciones"], default="pregunta",
+                        help="buscar solo con la pregunta o una vez por opción (pregunta + opción)")
+    parser.add_argument("--cupo", type=int, default=1, help="con --consulta opciones: chunks por opción")
     parser.add_argument("--out", type=Path, default=ROOT / "results")
     args = parser.parse_args()
 
@@ -120,7 +155,11 @@ def main():
     corpus = {c: leer_jsonl(CORPUS_DIR / f"{c}.jsonl") for c in args.corpus}
     docs, buscador = crear_buscador(args.retriever, args.modelo_denso, nombre, args.corpus, corpus)
     print("  Recuperando chunks...")
-    tops = recuperar(buscador, df["qtext"].tolist(), args.k)
+    if args.consulta == "opciones":
+        grupos = recuperar_por_opcion(buscador, df, args.cupo)
+    else:
+        grupos = [[(None, top)] for top in recuperar(buscador, df["qtext"].tolist(), args.k)]
+
     del buscador
     gc.collect()
     if torch.cuda.is_available():
@@ -131,10 +170,11 @@ def main():
     option_ids = option_token_ids(tokenizer)
 
     rows = []
-    for (_, row), top in tqdm(zip(df.iterrows(), tops), total=len(df)):
-        chunks = [docs[i] for i in top]
-        pred, probs = predict(build_rag_prompt(row, chunks), len(row["answers"]),
-                              tokenizer, model, option_ids)
+    for (_, row), g in tqdm(zip(df.iterrows(), grupos), total=len(df)):
+        chunks = [docs[i] for _, idx in g for i in idx]
+        prompt = (build_rag_prompt_opciones(row, g, docs) if args.consulta == "opciones"
+                  else build_rag_prompt(row, chunks))
+        pred, probs = predict(prompt, len(row["answers"]), tokenizer, model, option_ids)
         contexto = set().union(*(normalizar(f"{p['title']} {p['text']}") for p in chunks))
         rows.append({
             "year": row["year"], "category": row["category"], "qid": row["qid"],
@@ -146,7 +186,8 @@ def main():
 
     modelo = args.model.split("/")[-1]
     args.out.mkdir(parents=True, exist_ok=True)
-    out_file = args.out / f"baseline_{modelo}+rag-{args.retriever}-{nombre}-k{args.k}_{args.split}.jsonl"
+    etiqueta = f"k{args.k}" if args.consulta == "pregunta" else f"opc{args.cupo}"
+    out_file = args.out / f"baseline_{modelo}+rag-{args.retriever}-{nombre}-{etiqueta}_{args.split}.jsonl"
     results.to_json(out_file, orient="records", lines=True)
 
     print(f"\nModelo: {args.model} | RAG: {args.retriever} sobre {nombre}, k={args.k}"
