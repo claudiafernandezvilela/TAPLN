@@ -108,6 +108,8 @@ def main():
     parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default="hybrid")
     parser.add_argument("--modelo-denso", default=MODELO_DENSO, help="embeddings para dense o hybrid")
     parser.add_argument("--k", type=int, default=5, help="chunks de contexto por pregunta")
+    parser.add_argument("--aleatorio", action="store_true",
+                        help="control: k chunks al azar en vez de los recuperados")
     parser.add_argument("--out", type=Path, default=ROOT / "results")
     args = parser.parse_args()
 
@@ -121,7 +123,19 @@ def main():
     docs, buscador = crear_buscador(args.retriever, args.modelo_denso, nombre, args.corpus, corpus)
     print("  Recuperando chunks...")
     tops = recuperar(buscador, df["qtext"].tolist(), args.k)
-    del buscador
+
+    # Control: k chunks al azar en vez de los recuperados
+    if args.aleatorio:
+        rng = np.random.default_rng(SEED)
+        tops = [rng.choice(len(docs), args.k, replace=False).tolist() for _ in range(len(df))]
+
+    # Similitud coseno (embeddings) de cada chunk usado con la pregunta
+    denso = buscador.buscadores[1] if args.retriever == "hybrid" else buscador
+    sims = None
+    if args.retriever != "bm25":
+        q = denso.codificar(df["qtext"].tolist(), "query: ")
+        sims = [[float(denso.emb[i] @ q[iq]) for i in top] for iq, top in enumerate(tops)]
+    del buscador, denso
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -140,13 +154,15 @@ def main():
             "year": row["year"], "category": row["category"], "qid": row["qid"],
             "ra": row["ra"], "pred": pred, "correct": pred == row["ra"], "probs": probs,
             "chunks": [p["id"] for p in chunks],
+            "sims": sims[len(rows)] if sims else None,
             "correcta_en_contexto": presente(normalizar(respuesta_correcta(row)), contexto),
         })
     results = pd.DataFrame(rows)
 
     modelo = args.model.split("/")[-1]
     args.out.mkdir(parents=True, exist_ok=True)
-    out_file = args.out / f"baseline_{modelo}+rag-{args.retriever}-{nombre}-k{args.k}_{args.split}.jsonl"
+    etiqueta = f"k{args.k}" + ("-aleatorio" if args.aleatorio else "")
+    out_file = args.out / f"baseline_{modelo}+rag-{args.retriever}-{nombre}-{etiqueta}_{args.split}.jsonl"
     results.to_json(out_file, orient="records", lines=True)
 
     print(f"\nModelo: {args.model} | RAG: {args.retriever} sobre {nombre}, k={args.k}"
